@@ -22,3 +22,5 @@ rad.json
 TestResults.xml
 # database
 db.sqlite3
+# virtual env
+venv
