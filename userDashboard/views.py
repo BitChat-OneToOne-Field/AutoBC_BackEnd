@@ -6,6 +6,8 @@ from user.models import User
 from django.db.models import Sum
 from .serializers import TransactionSerializer, WithdrawalRequestSerializer
 from rest_framework import status
+import requests
+import json
 
 class UserDashboardView(APIView):
     permission_classes = [IsAuthenticated]
@@ -39,26 +41,33 @@ class DepositView(APIView):
         # Logic to process the deposit via the bot can be added here (Maybe)
         return Response({"error": "Invalid amount"}, status=status.HTTP_400_BAD_REQUEST)
     
+
 class WithdrawalRequestView(APIView):
     permission_classes = [IsAuthenticated]
 
     def post(self, request):
-        user = request.user
-        amount = request.data.get('amount')
-        usdt_address = request.data.get('usdt_address')
-        
-        if not usdt_address:
-            usdt_address = user.usdt_address
+        serializer = WithdrawalRequestSerializer(data=request.data)
+        if serializer.is_valid():
+            withdrawal_request = serializer.save(user=request.user)
+            
+            # Communicate with AutoBC bot
+            bot_url = "http://<your-bot-ip>:<your-bot-port>/withdraw"
+            bot_data = {
+                "usdt_address": withdrawal_request.usdt_address,
+                "amount": str(withdrawal_request.amount),
+            }
+            response = requests.post(bot_url, data=json.dumps(bot_data), headers={'Content-Type': 'application/json'})
+            
+            if response.status_code == 200:
+                withdrawal_request.status = 'completed'
+                withdrawal_request.save()
+                return Response({"message": "Withdrawal successful"}, status=status.HTTP_200_OK)
+            else:
+                withdrawal_request.status = 'failed'
+                withdrawal_request.save()
+                return Response({"error": "Withdrawal failed"}, status=status.HTTP_400_BAD_REQUEST)
+        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
-        withdrawal_request = WithdrawalRequest.objects.create(
-            user=user,
-            amount=amount,
-            usdt_address=usdt_address
-        )
-        
-        # Here you can add logic to send this request to the trading bot for processing
-        
-        return Response({"status": "Withdrawal request submitted"}, status=status.HTTP_201_CREATED)
 
 class TransactionHistoryView(APIView):
     permission_classes = [IsAuthenticated]
