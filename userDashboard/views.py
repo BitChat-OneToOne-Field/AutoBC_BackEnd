@@ -1,13 +1,16 @@
+import ccxt
 from rest_framework.views import APIView
 from rest_framework.response import Response
 from rest_framework.permissions import IsAuthenticated
 from .models import Transaction, WithdrawalRequest
 from user.models import User
+from django.conf import settings
 from django.db.models import Sum
 from .serializers import TransactionSerializer, WithdrawalRequestSerializer
 from rest_framework import status
-import requests
-import json
+import logging
+
+logger = logging.getLogger(__name__)
 
 class UserDashboardView(APIView):
     permission_classes = [IsAuthenticated]
@@ -29,45 +32,103 @@ class UserDashboardView(APIView):
             "profit_percentage": profit_percentage
         })
 
-class DepositView(APIView):
+class GenerateDepositAddressView(APIView):
     permission_classes = [IsAuthenticated]
 
     def post(self, request):
         user = request.user
-        amount = request.data.get('amount')
-        if amount and float(amount) > 0:
-            transaction = Transaction.objects.create(user=user, amount=amount, transaction_type='deposit')
-            return Response(TransactionSerializer(transaction).data, status=status.HTTP_201_CREATED)
-        # Logic to process the deposit via the bot can be added here (Maybe)
-        return Response({"error": "Invalid amount"}, status=status.HTTP_400_BAD_REQUEST)
-    
+        binance = ccxt.binance({
+            'apiKey': settings.BINANCE_API_KEY,
+            'secret': settings.BINANCE_SECRET_KEY,
+            'enableRateLimit': True,
+        })
+
+        try:
+            address = binance.fetch_deposit_address('USDT')
+            Transaction.objects.create(
+                user=user,
+                address=address['address'],
+                amount=request.data.get('amount'),
+                transaction_type='deposit',
+                status='pending'
+            )
+            return Response({"address": address['address']}, status=status.HTTP_201_CREATED)
+        except Exception as e:
+            logger.error(f"Error generating deposit address: {str(e)}")
+            return Response({"error": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+class CheckDepositsView(APIView):
+    def get(self, request):
+        binance = ccxt.binance({
+            'apiKey': settings.BINANCE_API_KEY,
+            'secret': settings.BINANCE_SECRET_KEY,
+            'enableRateLimit': True,
+        })
+
+        try:
+            deposits = binance.fetch_deposits('USDT')
+            for deposit in deposits:
+                transaction = Transaction.objects.filter(
+                    address=deposit['address'],
+                    transaction_type='deposit',
+                    status='pending'
+                ).first()
+                if transaction and float(deposit['amount']) >= float(transaction.amount):
+                    transaction.status = 'completed'
+                    transaction.save()
+                    user = transaction.user
+                    user.balance += float(deposit['amount'])
+                    user.save()
+            return Response({"message": "Deposits checked and updated."}, status=status.HTTP_200_OK)
+        except Exception as e:
+            logger.error(f"Error checking deposits: {str(e)}")
+            return Response({"error": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
 class WithdrawalRequestView(APIView):
     permission_classes = [IsAuthenticated]
 
     def post(self, request):
-        serializer = WithdrawalRequestSerializer(data=request.data)
-        if serializer.is_valid():
-            withdrawal_request = serializer.save(user=request.user)
-            
-            # Communicate with AutoBC bot
-            bot_url = "http://<your-bot-ip>:<your-bot-port>/withdraw"
-            bot_data = {
-                "usdt_address": withdrawal_request.usdt_address,
-                "amount": str(withdrawal_request.amount),
-            }
-            response = requests.post(bot_url, data=json.dumps(bot_data), headers={'Content-Type': 'application/json'})
-            
-            if response.status_code == 200:
-                withdrawal_request.status = 'completed'
-                withdrawal_request.save()
-                return Response({"message": "Withdrawal successful"}, status=status.HTTP_200_OK)
-            else:
-                withdrawal_request.status = 'failed'
-                withdrawal_request.save()
-                return Response({"error": "Withdrawal failed"}, status=status.HTTP_400_BAD_REQUEST)
-        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+        user = request.user
+        amount = request.data.get('amount')
+        usdt_address = request.data.get('usdt_address')
 
+        if not amount or not usdt_address or float(amount) <= 0:
+            return Response({"error": "Invalid amount or USDT address"}, status=status.HTTP_400_BAD_REQUEST)
+        
+        withdrawal_request = WithdrawalRequest.objects.create(
+            user=user, amount=amount, usdt_address=usdt_address, status='pending'
+        )
+
+        binance = ccxt.binance({
+            'apiKey': settings.BINANCE_API_KEY,
+            'secret': settings.BINANCE_SECRET_KEY,
+            'enableRateLimit': True,
+        })
+
+        try:
+            response = binance.withdraw(
+                code='USDT',  
+                amount=float(amount),
+                address=usdt_address,
+                tag=None,  
+            )
+
+            withdrawal_request.status = 'completed'
+            withdrawal_request.save()
+
+            Transaction.objects.create(
+                user=user,
+                amount=amount,
+                transaction_type='withdraw',
+                status='completed'
+            )
+
+            return Response(WithdrawalRequestSerializer(withdrawal_request).data, status=status.HTTP_201_CREATED)
+        except Exception as e:
+            withdrawal_request.status = 'failed'
+            withdrawal_request.save()
+            logger.error(f"Binance API error: {str(e)}")
+            return Response({"error": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
 class TransactionHistoryView(APIView):
     permission_classes = [IsAuthenticated]
@@ -77,11 +138,6 @@ class TransactionHistoryView(APIView):
         transactions = Transaction.objects.filter(user=user)
         serializer = TransactionSerializer(transactions, many=True)
         return Response(serializer.data)
-
-
-'''
-=================== For Bot Comunication ======================================
-'''
 
 class PendingWithdrawalsView(APIView):
     def get(self, request):
