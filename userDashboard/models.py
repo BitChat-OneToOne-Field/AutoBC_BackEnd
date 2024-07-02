@@ -10,6 +10,7 @@ class Transaction(models.Model):
     amount = models.DecimalField(max_digits=20, decimal_places=8)
     transaction_type = models.CharField(max_length=10, choices=TRANSACTION_TYPES)
     address = models.CharField(max_length=255, blank=True, null=True)
+    transaction_id = models.CharField(max_length=255, unique=True)  # Add this line
     status = models.CharField(max_length=10, default='pending')
     created_at = models.DateTimeField(auto_now_add=True)
 
